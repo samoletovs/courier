@@ -138,6 +138,20 @@ resource storage 'Microsoft.Storage/storageAccounts@2023-05-01' = {
   }
 }
 
+resource blobService 'Microsoft.Storage/storageAccounts/blobServices@2023-05-01' = {
+  parent: storage
+  name: 'default'
+}
+
+// Flex Consumption deployment package container (must exist before publish).
+resource appPackageContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' = {
+  parent: blobService
+  name: 'app-package'
+  properties: {
+    publicAccess: 'None'
+  }
+}
+
 // --- Azure Communication Services + Email -----------------------------------
 
 resource emailService 'Microsoft.Communication/emailServices@2023-04-01' = {
