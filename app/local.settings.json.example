@@ -1,0 +1,11 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "FUNCTIONS_WORKER_RUNTIME": "python",
+    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+    "ACS_ENDPOINT": "https://courier-acs.communication.azure.com",
+    "SENDER_ADDRESS": "donotreply@<guid>.azurecomm.net",
+    "ALLOWED_RECIPIENTS": "your-inbox@example.com",
+    "AZURE_CLIENT_ID": ""
+  }
+}

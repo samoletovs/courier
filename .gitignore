@@ -1,0 +1,19 @@
+# Build artifacts
+__pycache__/
+*.pyc
+.python_packages/
+.venv/
+venv/
+
+# Azure Functions local
+app/local.settings.json
+bin/
+obj/
+
+# Env
+.env
+*.log
+
+# OS
+.DS_Store
+Thumbs.db

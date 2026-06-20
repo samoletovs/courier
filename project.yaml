@@ -1,0 +1,14 @@
+name: courier
+purpose: "Shared NauroLabs email/notification service — any project POSTs a message and courier sends it via Azure Communication Services Email (managed identity)."
+users: "Internal — NauroLabs projects and agents (server-to-server)"
+stage: mvp
+goals:
+  - "Single ACS Email resource for the whole lab (one sender domain)"
+  - "HTTP send endpoint callable by any project (function-key auth)"
+  - "Managed identity / Entra auth — no connection strings in code"
+  - "Recipient allowlist to prevent open-relay abuse"
+  - "Cost discipline — ~€0/month (ACS has no base fee; pay-per-email is cents)"
+similar:
+  - "Transactional email (Resend/SendGrid) but Azure-native"
+  - "Internal notification microservice"
+quality: []
