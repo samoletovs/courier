@@ -122,6 +122,14 @@ def send(req: func.HttpRequest) -> func.HttpResponse:
     op_id = result.get("id") if isinstance(result, dict) else getattr(result, "id", None)
     logging.info("Email send status=%s id=%s recipients=%d", status, op_id, len(to))
 
+    if str(status).lower() != "succeeded":
+        logging.error("ACS email send did not succeed: status=%s id=%s", status, op_id)
+        return func.HttpResponse(
+            json.dumps({"error": "send failed", "status": str(status)}),
+            status_code=502,
+            mimetype="application/json",
+        )
+
     return func.HttpResponse(
         json.dumps({"status": str(status), "id": op_id}),
         status_code=202,
