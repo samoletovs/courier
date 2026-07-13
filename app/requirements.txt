@@ -1,3 +1,4 @@
 azure-functions
 azure-communication-email==1.0.0
 azure-identity
+azure-storage-blob

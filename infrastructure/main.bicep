@@ -152,6 +152,17 @@ resource appPackageContainer 'Microsoft.Storage/storageAccounts/blobServices/con
   }
 }
 
+// Feedback ledger container — the send function appends 👍/👎 votes here (one
+// append-blob per project, e.g. feedback/dealscout.jsonl). Written and read via the
+// Function's managed identity (Storage Blob Data Owner), never public.
+resource feedbackContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' = {
+  parent: blobService
+  name: 'feedback'
+  properties: {
+    publicAccess: 'None'
+  }
+}
+
 // --- Azure Communication Services + Email -----------------------------------
 
 resource emailService 'Microsoft.Communication/emailServices@2023-04-01' = {

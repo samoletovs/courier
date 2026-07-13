@@ -1,23 +1,36 @@
-"""courier — shared NauroLabs email send service.
+"""courier — shared NauroLabs email + lightweight feedback service.
 
-POST /api/send  (function-key auth)
-Body: { "to": str|list, "subject": str, "html": str, "text"?: str, "cc"?: list, "bcc"?: list }
+POST /api/send            (function-key auth) — send email via ACS.
+GET  /api/feedback        (anonymous)         — record a 👍/👎 vote from an email link.
+GET  /api/feedback/export (function-key auth) — read a project's votes back (JSONL).
 
-Sends via Azure Communication Services Email using a user-assigned managed
-identity. Enforces a recipient allowlist so it can never be an open relay.
+Email sends go through Azure Communication Services using a user-assigned managed
+identity, gated by a recipient allowlist so it can never be an open relay. Feedback
+votes are appended to a per-project append-blob in the Function's storage account
+(same managed identity, Storage Blob Data Owner) — no separate database.
 """
 
 import json
 import logging
 import os
+import re
+from datetime import datetime, timezone
 
 import azure.functions as func
 from azure.communication.email import EmailClient
+from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError
 from azure.identity import DefaultAzureCredential
+from azure.storage.blob import BlobServiceClient
 
 app = func.FunctionApp()
 
 MAX_BODY_BYTES = 256 * 1024  # cap payload size (HTML newsletters are small)
+
+# --- Feedback ledger (append-blob per project) ------------------------------
+FEEDBACK_CONTAINER = "feedback"
+_FEEDBACK_VERDICTS = ("up", "down")
+_PROJECT_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
+MAX_FEEDBACK_URL = 2048
 
 
 def _allowlist() -> list[str]:
@@ -147,3 +160,114 @@ def send(req: func.HttpRequest) -> func.HttpResponse:
         status_code=202 if accepted else 502,
         mimetype="application/json",
     )
+
+
+# --- Feedback ledger --------------------------------------------------------
+
+
+def _blob_service() -> BlobServiceClient:
+    """BlobServiceClient for the Function's storage account (managed-identity auth)."""
+    account = os.environ["AzureWebJobsStorage__accountName"]
+    client_id = os.environ.get("AZURE_CLIENT_ID")
+    credential = (
+        DefaultAzureCredential(managed_identity_client_id=client_id)
+        if client_id
+        else DefaultAzureCredential()
+    )
+    return BlobServiceClient(f"https://{account}.blob.core.windows.net", credential=credential)
+
+
+def _feedback_line(project: str, verdict: str, url: str) -> str:
+    """One JSONL row for a vote (UTC-timestamped)."""
+    return (
+        json.dumps(
+            {
+                "project": project,
+                "verdict": verdict,
+                "url": url,
+                "ts": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        + "\n"
+    )
+
+
+def _append_feedback(project: str, verdict: str, url: str) -> None:
+    """Append one vote to feedback/{project}.jsonl, creating the container/blob if new."""
+    service = _blob_service()
+    container = service.get_container_client(FEEDBACK_CONTAINER)
+    try:
+        container.create_container()
+    except ResourceExistsError:
+        pass
+    blob = container.get_blob_client(f"{project}.jsonl")
+    if not blob.exists():
+        try:
+            blob.create_append_blob()
+        except ResourceExistsError:
+            pass
+    blob.append_block(_feedback_line(project, verdict, url).encode("utf-8"))
+
+
+def _read_feedback(project: str) -> str:
+    """Return the raw JSONL for a project, or '' if it has no votes yet."""
+    blob = _blob_service().get_blob_client(FEEDBACK_CONTAINER, f"{project}.jsonl")
+    try:
+        return blob.download_blob().readall().decode("utf-8")
+    except ResourceNotFoundError:
+        return ""
+
+
+@app.route(route="feedback", methods=["GET"], auth_level=func.AuthLevel.ANONYMOUS)
+def feedback(req: func.HttpRequest) -> func.HttpResponse:
+    """Record a 👍/👎 vote clicked from an email link. Anonymous, write-only."""
+    project = (req.params.get("p") or "").strip().lower()
+    verdict = (req.params.get("v") or "").strip().lower()
+    url = (req.params.get("u") or "").strip()
+    if (
+        not _PROJECT_RE.match(project)
+        or verdict not in _FEEDBACK_VERDICTS
+        or not url.startswith(("http://", "https://"))
+        or len(url) > MAX_FEEDBACK_URL
+    ):
+        return func.HttpResponse(
+            "<!DOCTYPE html><html><body><h1>Invalid feedback link</h1></body></html>",
+            status_code=400,
+            mimetype="text/html",
+        )
+
+    try:
+        _append_feedback(project, verdict, url)
+    except Exception:  # noqa: BLE001 — best-effort; log details server-side
+        logging.exception("feedback record failed")
+        return func.HttpResponse(
+            "<!DOCTYPE html><html><body><h1>Could not record — try again later</h1></body></html>",
+            status_code=502,
+            mimetype="text/html",
+        )
+
+    emoji = "👍" if verdict == "up" else "👎"
+    return func.HttpResponse(
+        "<!DOCTYPE html><html><body style=\"font-family:system-ui,-apple-system,"
+        "'Segoe UI',Roboto,sans-serif;text-align:center;padding:3rem;\">"
+        f"<h1>{emoji} Thanks — recorded</h1><p>You can close this tab.</p></body></html>",
+        mimetype="text/html",
+    )
+
+
+@app.route(route="feedback/export", methods=["GET"], auth_level=func.AuthLevel.FUNCTION)
+def feedback_export(req: func.HttpRequest) -> func.HttpResponse:
+    """Return a project's recorded votes as JSONL (function-key auth)."""
+    project = (req.params.get("p") or "").strip().lower()
+    if not _PROJECT_RE.match(project):
+        return func.HttpResponse(
+            '{"error":"invalid project"}', status_code=400, mimetype="application/json"
+        )
+    try:
+        data = _read_feedback(project)
+    except Exception:  # noqa: BLE001 — best-effort; log details server-side
+        logging.exception("feedback export failed")
+        return func.HttpResponse(
+            '{"error":"read failed"}', status_code=502, mimetype="application/json"
+        )
+    return func.HttpResponse(data, status_code=200, mimetype="application/x-ndjson")
