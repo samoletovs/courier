@@ -183,6 +183,34 @@ resource senderUsername 'Microsoft.Communication/emailServices/domains/senderUse
   }
 }
 
+// Custom sender domain (mail.naurolabs.com) — verified and linked. Azure-managed
+// *.azurecomm.net domains deliver poorly to Outlook.com (junk/drop) and cap at
+// 5 emails/min & 10/hour; this verified custom domain with SPF/DKIM/DMARC fixes
+// deliverability and lifts the limits to 30/min & 100/hour.
+//
+// DNS records (ownership TXT, SPF, DKIM/DKIM2 CNAME, DMARC) live in the
+// naurolabs.com Cloud DNS zone (project era-erp). The four required records are
+// Verified in ACS; courier sends from dig@mail.naurolabs.com (see SENDER_ADDRESS).
+resource emailDomainCustom 'Microsoft.Communication/emailServices/domains@2023-04-01' = {
+  parent: emailService
+  name: 'mail.naurolabs.com'
+  location: 'global'
+  tags: tags
+  properties: {
+    domainManagement: 'CustomerManaged'
+    userEngagementTracking: 'Disabled'
+  }
+}
+
+resource senderUsernameCustom 'Microsoft.Communication/emailServices/domains/senderUsernames@2023-04-01' = {
+  parent: emailDomainCustom
+  name: 'dig'
+  properties: {
+    username: 'dig'
+    displayName: 'NauroLabs Courier'
+  }
+}
+
 resource acs 'Microsoft.Communication/communicationServices@2023-04-01' = {
   name: acsName
   location: 'global'
@@ -191,6 +219,7 @@ resource acs 'Microsoft.Communication/communicationServices@2023-04-01' = {
     dataLocation: acsDataLocation
     linkedDomains: [
       emailDomain.id
+      emailDomainCustom.id
     ]
   }
 }
@@ -203,6 +232,33 @@ resource acsRoleAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' 
     roleDefinitionId: contributorRoleId
     principalId: uami.properties.principalId
     principalType: 'ServicePrincipal'
+  }
+}
+
+// Stream ACS Email logs to Log Analytics. Without this, a "Succeeded" send is
+// the ONLY signal captured — the actual per-recipient delivery outcome
+// (Delivered / FilteredSpam / Suppressed / Bounced / Quarantined) is invisible.
+// EmailStatusUpdateOperational feeds the ACSEmailStatusUpdateOperational table,
+// which is how we diagnose "accepted but never arrived" (e.g. Outlook.com junk).
+resource acsDiagnostics 'Microsoft.Insights/diagnosticSettings@2021-05-01-preview' = {
+  scope: acs
+  name: 'acs-email-logs'
+  properties: {
+    workspaceId: logWorkspace.id
+    logs: [
+      {
+        category: 'EmailSendMailOperational'
+        enabled: true
+      }
+      {
+        category: 'EmailStatusUpdateOperational'
+        enabled: true
+      }
+      {
+        category: 'EmailUserEngagementOperational'
+        enabled: true
+      }
+    ]
   }
 }
 
@@ -286,7 +342,7 @@ resource functionApp 'Microsoft.Web/sites@2024-04-01' = {
         }
         {
           name: 'SENDER_ADDRESS'
-          value: 'donotreply@${emailDomain.properties.fromSenderDomain}'
+          value: 'dig@${emailDomainCustom.properties.fromSenderDomain}'
         }
         {
           name: 'ALLOWED_RECIPIENTS'
