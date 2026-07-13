@@ -120,7 +120,19 @@ def send(req: func.HttpRequest) -> func.HttpResponse:
 
     status = result.get("status") if isinstance(result, dict) else getattr(result, "status", "Unknown")
     op_id = result.get("id") if isinstance(result, dict) else getattr(result, "id", None)
-    logging.info("Email send status=%s id=%s recipients=%d", status, op_id, len(to))
+    status_str = str(status)
+    # `begin_send().result()` blocks until the operation is terminal; "Succeeded"
+    # means ACS accepted the message for delivery. Any other terminal status
+    # (Failed/Canceled) is a real failure — surface it as 502 so best-effort
+    # callers can log/alert instead of silently treating a 202 as success.
+    accepted = status_str.lower() == "succeeded"
+    logging.info(
+        "Email send status=%s id=%s recipients=%d accepted=%s",
+        status_str,
+        op_id,
+        len(to),
+        accepted,
+    )
 
     if str(status).lower() != "succeeded":
         logging.error("ACS email send did not succeed: status=%s id=%s", status, op_id)
@@ -131,7 +143,7 @@ def send(req: func.HttpRequest) -> func.HttpResponse:
         )
 
     return func.HttpResponse(
-        json.dumps({"status": str(status), "id": op_id}),
-        status_code=202,
+        json.dumps({"status": status_str, "id": op_id}),
+        status_code=202 if accepted else 502,
         mimetype="application/json",
     )
