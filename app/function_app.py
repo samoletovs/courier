@@ -127,9 +127,16 @@ def send(req: func.HttpRequest) -> func.HttpResponse:
     try:
         poller = email_client.begin_send(message)
         result = poller.result()
-    except Exception:  # noqa: BLE001 — surface a generic error, log details server-side
+    except Exception as exc:  # noqa: BLE001
         logging.exception("ACS email send failed")
-        return func.HttpResponse('{"error":"send failed"}', status_code=502, mimetype="application/json")
+        # The endpoint is key-protected and single-caller, so echoing the ACS error is worth
+        # far more than hiding it: without this the only symptom is a bare 502 and the next
+        # debugging session starts from zero.
+        return func.HttpResponse(
+            json.dumps({"error": "send failed", "detail": f"{type(exc).__name__}: {exc}"[:500]}),
+            status_code=502,
+            mimetype="application/json",
+        )
 
     status = result.get("status") if isinstance(result, dict) else getattr(result, "status", "Unknown")
     op_id = result.get("id") if isinstance(result, dict) else getattr(result, "id", None)
@@ -148,9 +155,10 @@ def send(req: func.HttpRequest) -> func.HttpResponse:
     )
 
     if str(status).lower() != "succeeded":
-        logging.error("ACS email send did not succeed: status=%s id=%s", status, op_id)
+        err = result.get("error") if isinstance(result, dict) else getattr(result, "error", None)
+        logging.error("ACS email send did not succeed: status=%s id=%s error=%s", status, op_id, err)
         return func.HttpResponse(
-            json.dumps({"error": "send failed", "status": str(status)}),
+            json.dumps({"error": "send failed", "status": str(status), "detail": str(err)[:500] if err else None}),
             status_code=502,
             mimetype="application/json",
         )
