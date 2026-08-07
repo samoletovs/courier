@@ -15,6 +15,7 @@ import logging
 import os
 import re
 from datetime import datetime, timezone
+from typing import Protocol
 
 import azure.functions as func
 from azure.communication.email import EmailClient
@@ -33,9 +34,49 @@ _PROJECT_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
 MAX_FEEDBACK_URL = 2048
 
 
+def _parse_allowlist(raw_allowlist: str) -> list[str]:
+    return [a.strip().lower() for a in raw_allowlist.split(",") if a.strip()]
+
+
+class RecipientManager(Protocol):
+    """Recipient allowlist interface used by send flows."""
+
+    def allowlist_entries(self) -> list[str]:
+        """Return normalized allowlist entries."""
+
+    def has_entries(self) -> bool:
+        """Return True when allowlist contains at least one entry."""
+
+    def is_allowed(self, address: str) -> bool:
+        """Return True when a recipient address is allowed."""
+
+
+class EnvRecipientManager:
+    """Recipient manager backed by ALLOWED_RECIPIENTS."""
+
+    def __init__(self, raw_allowlist: str):
+        self._allow = _parse_allowlist(raw_allowlist)
+
+    @classmethod
+    def from_env(cls) -> "EnvRecipientManager":
+        return cls(os.environ.get("ALLOWED_RECIPIENTS", ""))
+
+    def has_entries(self) -> bool:
+        return bool(self._allow)
+
+    def allowlist_entries(self) -> list[str]:
+        return list(self._allow)
+
+    def is_allowed(self, address: str) -> bool:
+        return _is_allowed(address, self._allow)
+
+
+def _recipient_manager() -> RecipientManager:
+    return EnvRecipientManager.from_env()
+
+
 def _allowlist() -> list[str]:
-    raw = os.environ.get("ALLOWED_RECIPIENTS", "")
-    return [a.strip().lower() for a in raw.split(",") if a.strip()]
+    return _recipient_manager().allowlist_entries()
 
 
 def _is_allowed(address: str, allow: list[str]) -> bool:
@@ -91,13 +132,13 @@ def send(req: func.HttpRequest) -> func.HttpResponse:
         )
 
     # Open-relay guard: every recipient must match the allowlist.
-    allow = _allowlist()
-    if not allow:
+    manager = _recipient_manager()
+    if not manager.has_entries():
         logging.error("ALLOWED_RECIPIENTS not configured — refusing to send.")
         return func.HttpResponse('{"error":"server not configured"}', status_code=500, mimetype="application/json")
 
     for address in to + cc + bcc:
-        if not _is_allowed(address, allow):
+        if not manager.is_allowed(address):
             logging.warning("Rejected recipient outside allowlist (domain only logged).")
             return func.HttpResponse(
                 '{"error":"recipient not allowed"}', status_code=403, mimetype="application/json"
