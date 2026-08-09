@@ -2,12 +2,13 @@
 
 import os
 import sys
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
+import azure.functions as func
 
 # Ensure the app package is on the path.
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from function_app import EnvRecipientManager, _allowlist, _is_allowed  # noqa: E402
+from function_app import EnvRecipientManager, _allowlist, _is_allowed, send  # noqa: E402
 
 
 class TestEnvRecipientManager:
@@ -48,3 +49,20 @@ def test_is_allowed_helper_rejects_malformed():
 
 def test_is_allowed_helper_accepts_bare_domain_entry():
     assert _is_allowed("person@example.com", ["example.com"])
+
+
+def test_send_uses_recipient_manager_to_reject_disallowed_recipient():
+    manager = MagicMock()
+    manager.has_entries.return_value = True
+    manager.is_allowed.return_value = False
+    request = func.HttpRequest(
+        method="POST",
+        url="http://localhost/api/send",
+        body=b'{"to":"blocked@example.com","subject":"Test","text":"Body"}',
+    )
+
+    with patch("function_app._recipient_manager", return_value=manager):
+        response = send(request)
+
+    assert response.status_code == 403
+    manager.is_allowed.assert_called_once_with("blocked@example.com")
