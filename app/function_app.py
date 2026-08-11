@@ -26,6 +26,7 @@ from azure.storage.blob import BlobServiceClient
 app = func.FunctionApp()
 
 MAX_BODY_BYTES = 256 * 1024  # cap payload size (HTML newsletters are small)
+MAX_ADDRESS_LENGTH = 320  # RFC 5321 max email address length
 
 # --- Feedback ledger (append-blob per project) ------------------------------
 FEEDBACK_CONTAINER = "feedback"
@@ -209,6 +210,38 @@ def send(req: func.HttpRequest) -> func.HttpResponse:
         status_code=202 if accepted else 502,
         mimetype="application/json",
     )
+
+
+# --- Recipient management ---------------------------------------------------
+
+
+@app.route(route="recipients", methods=["GET"], auth_level=func.AuthLevel.FUNCTION)
+def recipients(req: func.HttpRequest) -> func.HttpResponse:
+    """Inspect the recipient allowlist (function-key auth).
+
+    Returns the configured entries so an operator can see exactly what `send`
+    will accept, and — with `?address=` — whether a candidate address passes the
+    guard. Read-only: the allowlist itself stays configuration (ALLOWED_RECIPIENTS).
+    """
+    manager = _recipient_manager()
+    entries = manager.allowlist_entries()
+    payload: dict = {
+        "configured": manager.has_entries(),
+        "count": len(entries),
+        "entries": entries,
+    }
+
+    address = (req.params.get("address") or "").strip()
+    if len(address) > MAX_ADDRESS_LENGTH:
+        return func.HttpResponse(
+            '{"error":"address too long"}', status_code=400, mimetype="application/json"
+        )
+    if address:
+        # The address is echoed back to the (key-authenticated) caller only; never logged.
+        payload["check"] = {"address": address, "allowed": manager.is_allowed(address)}
+
+    logging.info("Recipient allowlist queried entries=%d checked=%s", len(entries), bool(address))
+    return func.HttpResponse(json.dumps(payload), status_code=200, mimetype="application/json")
 
 
 # --- Feedback ledger --------------------------------------------------------

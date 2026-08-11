@@ -1,5 +1,6 @@
 """Tests for recipient allowlist management."""
 
+import json
 import os
 import sys
 from unittest.mock import MagicMock, patch
@@ -8,7 +9,14 @@ import azure.functions as func
 
 # Ensure the app package is on the path.
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from function_app import EnvRecipientManager, _allowlist, _is_allowed, send  # noqa: E402
+from function_app import (  # noqa: E402
+    MAX_ADDRESS_LENGTH,
+    EnvRecipientManager,
+    _allowlist,
+    _is_allowed,
+    recipients,
+    send,
+)
 
 
 class TestEnvRecipientManager:
@@ -66,3 +74,50 @@ def test_send_uses_recipient_manager_to_reject_disallowed_recipient():
 
     assert response.status_code == 403
     manager.is_allowed.assert_called_once_with("blocked@example.com")
+
+
+def _recipients_request(params: dict | None = None) -> func.HttpRequest:
+    return func.HttpRequest(
+        method="GET",
+        url="http://localhost/api/recipients",
+        body=b"",
+        params=params or {},
+    )
+
+
+class TestRecipientsEndpoint:
+    def test_lists_configured_allowlist(self):
+        with patch.dict(os.environ, {"ALLOWED_RECIPIENTS": "one@example.com,@example.org"}, clear=False):
+            response = recipients(_recipients_request())
+        assert response.status_code == 200
+        payload = json.loads(response.get_body())
+        assert payload == {
+            "configured": True,
+            "count": 2,
+            "entries": ["one@example.com", "@example.org"],
+        }
+
+    def test_reports_unconfigured_allowlist(self):
+        with patch.dict(os.environ, {"ALLOWED_RECIPIENTS": ""}, clear=False):
+            response = recipients(_recipients_request())
+        payload = json.loads(response.get_body())
+        assert payload == {"configured": False, "count": 0, "entries": []}
+
+    def test_checks_allowed_address(self):
+        with patch.dict(os.environ, {"ALLOWED_RECIPIENTS": "example.net"}, clear=False):
+            response = recipients(_recipients_request({"address": "user@example.net"}))
+        payload = json.loads(response.get_body())
+        assert payload["check"] == {"address": "user@example.net", "allowed": True}
+
+    def test_checks_disallowed_address(self):
+        with patch.dict(os.environ, {"ALLOWED_RECIPIENTS": "example.net"}, clear=False):
+            response = recipients(_recipients_request({"address": "user@example.com"}))
+        payload = json.loads(response.get_body())
+        assert payload["check"] == {"address": "user@example.com", "allowed": False}
+
+    def test_rejects_oversized_address(self):
+        domain = "@example.com"
+        long_address = "a" * (MAX_ADDRESS_LENGTH + 1 - len(domain)) + domain
+        with patch.dict(os.environ, {"ALLOWED_RECIPIENTS": "example.com"}, clear=False):
+            response = recipients(_recipients_request({"address": long_address}))
+        assert response.status_code == 400

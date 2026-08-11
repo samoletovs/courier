@@ -34,8 +34,26 @@ Response: `{ "status": "Succeeded", "id": "<operation-id>" }`.
 - Recipients must match `ALLOWED_RECIPIENTS` (comma-separated emails/domains). Anything else is rejected — courier is **not** an open relay.
 - `code` (function key) required. Store it as a secret in each caller (e.g. a GitHub Actions secret).
 
-### `GET /api/feedback` — record a 👍/👎 vote (anonymous)
+### `GET /api/recipients?code=<function-key>` — inspect the allowlist
 
+Read-only view of the recipient allowlist that `POST /api/send` enforces, so you can check what courier will accept without sending a test message.
+
+| Parameter | Description |
+|---|---|
+| `address` | Optional. A candidate recipient to test against the allowlist (max 320 chars) |
+
+```jsonc
+{
+  "configured": true,
+  "count": 2,
+  "entries": ["you@example.com", "@example.org"],
+  "check": { "address": "someone@example.org", "allowed": true }  // only when ?address= is given
+}
+```
+
+`check` is omitted when no `address` is supplied. The allowlist itself remains configuration — change it via the `ALLOWED_RECIPIENTS` app setting.
+
+### `GET /api/feedback` — record a 👍/👎 vote (anonymous)
 Embed these links in your HTML email. When a recipient clicks one, their vote is appended to a per-project append-blob in Azure Blob Storage and they see a simple confirmation page.
 
 | Parameter | Description |
