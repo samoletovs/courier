@@ -86,6 +86,23 @@ def _recipients_request(params: dict | None = None) -> func.HttpRequest:
 
 
 class TestRecipientsEndpoint:
+    def test_uses_recipient_manager_interface(self):
+        manager = MagicMock()
+        manager.allowlist_entries.return_value = ["example.net"]
+        manager.has_entries.return_value = True
+        manager.is_allowed.return_value = True
+
+        with patch("function_app._recipient_manager", return_value=manager):
+            response = recipients(_recipients_request({"address": "user@example.net"}))
+
+        assert json.loads(response.get_body()) == {
+            "configured": True,
+            "count": 1,
+            "entries": ["example.net"],
+            "check": {"address": "user@example.net", "allowed": True},
+        }
+        manager.is_allowed.assert_called_once_with("user@example.net")
+
     def test_lists_configured_allowlist(self):
         with patch.dict(os.environ, {"ALLOWED_RECIPIENTS": "one@example.com,@example.org"}, clear=False):
             response = recipients(_recipients_request())
