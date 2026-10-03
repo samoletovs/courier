@@ -20,3 +20,10 @@ Thumbs.db
 
 # Local-only personal-info pattern overrides
 scripts/.leak-patterns.local.txt
+
+# Added by autopilot
+node_modules/
+dist/
+*.png
+screenshots/
+.playwright-mcp/
