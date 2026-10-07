@@ -34,9 +34,9 @@ Response: `{ "status": "Succeeded", "id": "<operation-id>" }`.
 - Recipients must match `ALLOWED_RECIPIENTS` (comma-separated emails/domains). Anything else is rejected — courier is **not** an open relay.
 - `code` (function key) required. Store it as a secret in each caller (e.g. a GitHub Actions secret).
 
-### `GET /api/recipients?code=<function-key>` — inspect the allowlist
+### `/api/recipients?code=<function-key>` — inspect or manage the allowlist
 
-Read-only view of the recipient allowlist that `POST /api/send` enforces, so you can check what courier will accept without sending a test message.
+Function-key-protected recipient allowlist management. `GET` shows the entries that `POST /api/send` enforces, so you can check what courier will accept without sending a test message.
 
 | Parameter | Description |
 |---|---|
@@ -51,7 +51,15 @@ Read-only view of the recipient allowlist that `POST /api/send` enforces, so you
 }
 ```
 
-`check` is omitted when no `address` is supplied. The allowlist itself remains configuration — change it via the `ALLOWED_RECIPIENTS` app setting.
+`check` is omitted when no `address` is supplied.
+
+`POST` adds an entry and `DELETE` removes an entry. Both require a JSON body with one email address, domain, or `@domain` entry:
+
+```json
+{ "address": "someone@example.org" }
+```
+
+Changes are stored in the Function's Blob Storage account and immediately used by subsequent sends. Until the first update, the configured `ALLOWED_RECIPIENTS` value is used as the initial allowlist; after an update, the persisted list is authoritative. These operations require the Function managed identity to have Blob Storage data access, as provisioned by `infrastructure/main.bicep`.
 
 ### `GET /api/feedback` — record a 👍/👎 vote (anonymous)
 Embed these links in your HTML email. When a recipient clicks one, their vote is appended to a per-project append-blob in Azure Blob Storage and they see a simple confirmation page.
