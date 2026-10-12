@@ -19,7 +19,8 @@ from typing import Protocol
 
 import azure.functions as func
 from azure.communication.email import EmailClient
-from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError
+from azure.core import MatchConditions
+from azure.core.exceptions import ResourceExistsError, ResourceModifiedError, ResourceNotFoundError
 from azure.identity import DefaultAzureCredential
 from azure.storage.blob import BlobServiceClient
 
@@ -36,6 +37,7 @@ MAX_FEEDBACK_URL = 2048
 ALLOWLIST_CONTAINER = "config"
 ALLOWLIST_BLOB = "recipients.json"
 MAX_RECIPIENT_REQUEST_BYTES = 4096
+MAX_ALLOWLIST_UPDATE_ATTEMPTS = 3
 _DOMAIN_RE = re.compile(r"^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$")
 
 
@@ -107,20 +109,35 @@ def _normalize_recipient_entry(value) -> str | None:
     return entry
 
 
-def _read_allowlist_entries() -> list[str]:
-    if not (os.environ.get("AzureWebJobsStorage__accountName") or os.environ.get("AzureWebJobsStorage")):
-        return EnvRecipientManager.from_env().allowlist_entries()
-    blob = _blob_service().get_blob_client(ALLOWLIST_CONTAINER, ALLOWLIST_BLOB)
-    try:
-        entries = json.loads(blob.download_blob().readall().decode("utf-8"))
-    except ResourceNotFoundError:
-        return EnvRecipientManager.from_env().allowlist_entries()
+def _decode_allowlist_entries(data: bytes) -> list[str]:
+    entries = json.loads(data.decode("utf-8"))
     if not isinstance(entries, list) or any(_normalize_recipient_entry(entry) is None for entry in entries):
         raise ValueError("Stored recipient allowlist is invalid")
     return list(dict.fromkeys(_normalize_recipient_entry(entry) for entry in entries))
 
 
-def _write_allowlist_entries(entries: list[str]) -> None:
+def _read_allowlist_blob(blob) -> tuple[list[str], str | None]:
+    try:
+        downloader = blob.download_blob()
+    except ResourceNotFoundError:
+        return EnvRecipientManager.from_env().allowlist_entries(), None
+
+    properties = downloader.properties
+    etag = properties.get("etag") if isinstance(properties, dict) else getattr(properties, "etag", None)
+    if not etag:
+        raise ValueError("Stored recipient allowlist has no ETag")
+    return _decode_allowlist_entries(downloader.readall()), etag
+
+
+def _read_allowlist_entries() -> list[str]:
+    if not (os.environ.get("AzureWebJobsStorage__accountName") or os.environ.get("AzureWebJobsStorage")):
+        return EnvRecipientManager.from_env().allowlist_entries()
+    blob = _blob_service().get_blob_client(ALLOWLIST_CONTAINER, ALLOWLIST_BLOB)
+    entries, _ = _read_allowlist_blob(blob)
+    return entries
+
+
+def _update_allowlist_entry(address: str, add: bool) -> list[str]:
     service = _blob_service()
     container = service.get_container_client(ALLOWLIST_CONTAINER)
     try:
@@ -128,7 +145,29 @@ def _write_allowlist_entries(entries: list[str]) -> None:
     except ResourceExistsError:
         pass
     blob = container.get_blob_client(ALLOWLIST_BLOB)
-    blob.upload_blob(json.dumps(entries), overwrite=True)
+
+    for _ in range(MAX_ALLOWLIST_UPDATE_ATTEMPTS):
+        entries, etag = _read_allowlist_blob(blob)
+        if add:
+            if address not in entries:
+                entries.append(address)
+        else:
+            entries = [entry for entry in entries if entry != address]
+
+        try:
+            if etag is None:
+                blob.upload_blob(json.dumps(entries), overwrite=False)
+            else:
+                blob.upload_blob(
+                    json.dumps(entries),
+                    overwrite=True,
+                    etag=etag,
+                    match_condition=MatchConditions.IfNotModified,
+                )
+            return entries
+        except (ResourceExistsError, ResourceModifiedError):
+            continue
+    raise RuntimeError("Recipient allowlist changed during update")
 
 
 def _is_allowed(address: str, allow: list[str]) -> bool:
@@ -292,13 +331,7 @@ def recipients(req: func.HttpRequest) -> func.HttpResponse:
         if address is None:
             return func.HttpResponse('{"error":"invalid address"}', status_code=400, mimetype="application/json")
         try:
-            entries = _allowlist()
-            if req.method == "POST":
-                if address not in entries:
-                    entries.append(address)
-            else:
-                entries = [entry for entry in entries if entry != address]
-            _write_allowlist_entries(entries)
+            entries = _update_allowlist_entry(address, add=req.method == "POST")
         except Exception:  # noqa: BLE001 — do not expose storage details to callers
             logging.exception("Recipient allowlist update failed")
             return func.HttpResponse(

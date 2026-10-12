@@ -32,11 +32,11 @@ Response: `{ "status": "Succeeded", "id": "<operation-id>" }`.
 
 **Guardrails**
 - Recipients must match `ALLOWED_RECIPIENTS` (comma-separated emails/domains). Anything else is rejected — courier is **not** an open relay.
-- `code` (function key) required. Store it as a secret in each caller (e.g. a GitHub Actions secret).
+- A `send` function-specific key is required. Store it as a secret in each caller (e.g. a GitHub Actions secret). Do not distribute the host key or the `recipients` function key to send-only callers.
 
 ### `/api/recipients?code=<function-key>` — inspect or manage the allowlist
 
-Function-key-protected recipient allowlist management. `GET` shows the entries that `POST /api/send` enforces, so you can check what courier will accept without sending a test message.
+Operator-only recipient allowlist management protected by the `recipients` function-specific key. `GET` shows the entries that `POST /api/send` enforces, so you can check what courier will accept without sending a test message. Normal send callers receive only the separate `send` function key; never give them a host key, because host keys authorize every function.
 
 | Parameter | Description |
 |---|---|
