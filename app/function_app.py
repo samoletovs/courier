@@ -19,7 +19,8 @@ from typing import Protocol
 
 import azure.functions as func
 from azure.communication.email import EmailClient
-from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError
+from azure.core import MatchConditions
+from azure.core.exceptions import ResourceExistsError, ResourceModifiedError, ResourceNotFoundError
 from azure.identity import DefaultAzureCredential
 from azure.storage.blob import BlobServiceClient
 
@@ -33,6 +34,11 @@ FEEDBACK_CONTAINER = "feedback"
 _FEEDBACK_VERDICTS = ("up", "down")
 _PROJECT_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
 MAX_FEEDBACK_URL = 2048
+ALLOWLIST_CONTAINER = "config"
+ALLOWLIST_BLOB = "recipients.json"
+MAX_RECIPIENT_REQUEST_BYTES = 4096
+MAX_ALLOWLIST_UPDATE_ATTEMPTS = 3
+_DOMAIN_RE = re.compile(r"^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$")
 
 
 def _parse_allowlist(raw_allowlist: str) -> list[str]:
@@ -73,11 +79,95 @@ class EnvRecipientManager:
 
 
 def _recipient_manager() -> RecipientManager:
-    return EnvRecipientManager.from_env()
+    entries = _read_allowlist_entries()
+    return EnvRecipientManager(",".join(entries))
 
 
 def _allowlist() -> list[str]:
     return _recipient_manager().allowlist_entries()
+
+
+def _normalize_recipient_entry(value) -> str | None:
+    if not isinstance(value, str):
+        return None
+    entry = value.strip().lower()
+    if not entry or len(entry) > MAX_ADDRESS_LENGTH or any(c.isspace() for c in entry) or "," in entry:
+        return None
+    if entry.startswith("@"):
+        domain = entry[1:]
+    elif "@" in entry:
+        parts = entry.split("@")
+        if len(parts) != 2 or not parts[0] or len(parts[0]) > 64:
+            return None
+        domain = parts[1]
+    else:
+        domain = entry
+    if not domain or len(domain) > 253 or not _DOMAIN_RE.fullmatch(domain):
+        return None
+    if any(not label or len(label) > 63 or label.startswith("-") or label.endswith("-") for label in domain.split(".")):
+        return None
+    return entry
+
+
+def _decode_allowlist_entries(data: bytes) -> list[str]:
+    entries = json.loads(data.decode("utf-8"))
+    if not isinstance(entries, list) or any(_normalize_recipient_entry(entry) is None for entry in entries):
+        raise ValueError("Stored recipient allowlist is invalid")
+    return list(dict.fromkeys(_normalize_recipient_entry(entry) for entry in entries))
+
+
+def _read_allowlist_blob(blob) -> tuple[list[str], str | None]:
+    try:
+        downloader = blob.download_blob()
+    except ResourceNotFoundError:
+        return EnvRecipientManager.from_env().allowlist_entries(), None
+
+    properties = downloader.properties
+    etag = properties.get("etag") if isinstance(properties, dict) else getattr(properties, "etag", None)
+    if not etag:
+        raise ValueError("Stored recipient allowlist has no ETag")
+    return _decode_allowlist_entries(downloader.readall()), etag
+
+
+def _read_allowlist_entries() -> list[str]:
+    if not (os.environ.get("AzureWebJobsStorage__accountName") or os.environ.get("AzureWebJobsStorage")):
+        return EnvRecipientManager.from_env().allowlist_entries()
+    blob = _blob_service().get_blob_client(ALLOWLIST_CONTAINER, ALLOWLIST_BLOB)
+    entries, _ = _read_allowlist_blob(blob)
+    return entries
+
+
+def _update_allowlist_entry(address: str, add: bool) -> list[str]:
+    service = _blob_service()
+    container = service.get_container_client(ALLOWLIST_CONTAINER)
+    try:
+        container.create_container()
+    except ResourceExistsError:
+        pass
+    blob = container.get_blob_client(ALLOWLIST_BLOB)
+
+    for _ in range(MAX_ALLOWLIST_UPDATE_ATTEMPTS):
+        entries, etag = _read_allowlist_blob(blob)
+        if add:
+            if address not in entries:
+                entries.append(address)
+        else:
+            entries = [entry for entry in entries if entry != address]
+
+        try:
+            if etag is None:
+                blob.upload_blob(json.dumps(entries), overwrite=False)
+            else:
+                blob.upload_blob(
+                    json.dumps(entries),
+                    overwrite=True,
+                    etag=etag,
+                    match_condition=MatchConditions.IfNotModified,
+                )
+            return entries
+        except (ResourceExistsError, ResourceModifiedError):
+            continue
+    raise RuntimeError("Recipient allowlist changed during update")
 
 
 def _is_allowed(address: str, allow: list[str]) -> bool:
@@ -133,7 +223,13 @@ def send(req: func.HttpRequest) -> func.HttpResponse:
         )
 
     # Open-relay guard: every recipient must match the allowlist.
-    manager = _recipient_manager()
+    try:
+        manager = _recipient_manager()
+    except Exception:  # noqa: BLE001 — fail closed if persisted policy is unavailable
+        logging.exception("Recipient allowlist unavailable")
+        return func.HttpResponse(
+            '{"error":"recipient allowlist unavailable"}', status_code=503, mimetype="application/json"
+        )
     if not manager.has_entries():
         logging.error("ALLOWED_RECIPIENTS not configured — refusing to send.")
         return func.HttpResponse('{"error":"server not configured"}', status_code=500, mimetype="application/json")
@@ -215,15 +311,46 @@ def send(req: func.HttpRequest) -> func.HttpResponse:
 # --- Recipient management ---------------------------------------------------
 
 
-@app.route(route="recipients", methods=["GET"], auth_level=func.AuthLevel.FUNCTION)
+@app.route(route="recipients", methods=["GET", "POST", "DELETE"], auth_level=func.AuthLevel.FUNCTION)
 def recipients(req: func.HttpRequest) -> func.HttpResponse:
-    """Inspect the recipient allowlist (function-key auth).
+    """Inspect or manage the recipient allowlist (function-key auth).
 
     Returns the configured entries so an operator can see exactly what `send`
     will accept, and — with `?address=` — whether a candidate address passes the
-    guard. Read-only: the allowlist itself stays configuration (ALLOWED_RECIPIENTS).
+    guard. POST adds and DELETE removes an entry using a JSON `address` field.
     """
-    manager = _recipient_manager()
+    if req.method in ("POST", "DELETE"):
+        body = req.get_body() or b""
+        if len(body) > MAX_RECIPIENT_REQUEST_BYTES:
+            return func.HttpResponse('{"error":"payload too large"}', status_code=413, mimetype="application/json")
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return func.HttpResponse('{"error":"invalid JSON"}', status_code=400, mimetype="application/json")
+        address = _normalize_recipient_entry(payload.get("address") if isinstance(payload, dict) else None)
+        if address is None:
+            return func.HttpResponse('{"error":"invalid address"}', status_code=400, mimetype="application/json")
+        try:
+            entries = _update_allowlist_entry(address, add=req.method == "POST")
+        except Exception:  # noqa: BLE001 — do not expose storage details to callers
+            logging.exception("Recipient allowlist update failed")
+            return func.HttpResponse(
+                '{"error":"recipient allowlist update failed"}', status_code=502, mimetype="application/json"
+            )
+        logging.info("Recipient allowlist updated action=%s entries=%d", req.method.lower(), len(entries))
+        return func.HttpResponse(
+            json.dumps({"configured": bool(entries), "count": len(entries), "entries": entries}),
+            status_code=200,
+            mimetype="application/json",
+        )
+
+    try:
+        manager = _recipient_manager()
+    except Exception:  # noqa: BLE001 — do not expose storage details to callers
+        logging.exception("Recipient allowlist unavailable")
+        return func.HttpResponse(
+            '{"error":"recipient allowlist unavailable"}', status_code=502, mimetype="application/json"
+        )
     entries = manager.allowlist_entries()
     payload: dict = {
         "configured": manager.has_entries(),
@@ -249,7 +376,12 @@ def recipients(req: func.HttpRequest) -> func.HttpResponse:
 
 def _blob_service() -> BlobServiceClient:
     """BlobServiceClient for the Function's storage account (managed-identity auth)."""
-    account = os.environ["AzureWebJobsStorage__accountName"]
+    account = os.environ.get("AzureWebJobsStorage__accountName")
+    if not account:
+        connection_string = os.environ.get("AzureWebJobsStorage")
+        if not connection_string:
+            raise RuntimeError("Blob storage is not configured")
+        return BlobServiceClient.from_connection_string(connection_string)
     client_id = os.environ.get("AZURE_CLIENT_ID")
     credential = (
         DefaultAzureCredential(managed_identity_client_id=client_id)

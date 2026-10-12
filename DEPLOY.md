@@ -28,21 +28,23 @@ cd app
 func azure functionapp publish <functionAppName>   # from deployment output
 ```
 
-## 3. Get the function key (store as a caller secret)
+## 3. Get function-specific keys
 
 ```powershell
-az functionapp keys list -g courier-rg -n <functionAppName> --query "functionKeys.default" -o tsv
+$sendKey = az functionapp function keys list -g courier-rg -n <functionAppName> `
+  --function-name send --query "default" -o tsv
+$recipientsKey = az functionapp function keys list -g courier-rg -n <functionAppName> `
+  --function-name recipients --query "default" -o tsv
 ```
 
-Store this as a secret in each caller (e.g. a GitHub Actions secret `COURIER_KEY`). Never commit it.
+Store `$sendKey` as each caller's secret (for example, `COURIER_KEY`). Keep `$recipientsKey` operator-only. Never distribute the app-level host key: it authorizes both sending and allowlist mutation. Rotate any host key that was previously shared with callers.
 
 ## 4. Smoke test
 
 ```powershell
-$key = az functionapp keys list -g courier-rg -n <functionAppName> --query "functionKeys.default" -o tsv
 $host = az functionapp show -g courier-rg -n <functionAppName> --query defaultHostName -o tsv
 $body = @{ to='you@example.com'; subject='courier smoke test'; html='<p>It works.</p>' } | ConvertTo-Json
-Invoke-RestMethod -Method Post -Uri "https://$host/api/send?code=$key" -ContentType 'application/json' -Body $body
+Invoke-RestMethod -Method Post -Uri "https://$host/api/send?code=$sendKey" -ContentType 'application/json' -Body $body
 ```
 
 A `202` with `{ status: "Succeeded", id: ... }` means email is live.

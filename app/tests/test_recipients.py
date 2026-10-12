@@ -6,6 +6,7 @@ import sys
 from unittest.mock import MagicMock, patch
 
 import azure.functions as func
+from azure.core.exceptions import ResourceModifiedError
 
 # Ensure the app package is on the path.
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -14,6 +15,8 @@ from function_app import (  # noqa: E402
     EnvRecipientManager,
     _allowlist,
     _is_allowed,
+    _recipient_manager,
+    _update_allowlist_entry,
     recipients,
     send,
 )
@@ -85,6 +88,14 @@ def _recipients_request(params: dict | None = None) -> func.HttpRequest:
     )
 
 
+def _recipient_mutation_request(method: str, payload: bytes) -> func.HttpRequest:
+    return func.HttpRequest(
+        method=method,
+        url="http://localhost/api/recipients",
+        body=payload,
+    )
+
+
 class TestRecipientsEndpoint:
     def test_uses_recipient_manager_interface(self):
         manager = MagicMock()
@@ -138,3 +149,95 @@ class TestRecipientsEndpoint:
         with patch.dict(os.environ, {"ALLOWED_RECIPIENTS": "example.com"}, clear=False):
             response = recipients(_recipients_request({"address": long_address}))
         assert response.status_code == 400
+
+    def test_add_and_remove_persist_entries_used_by_send_allowlist(self):
+        stored = {"value": b'["one@example.com"]', "etag": '"1"'}
+        blob = MagicMock()
+
+        def download_blob():
+            downloader = MagicMock()
+            downloader.readall.return_value = stored["value"]
+            downloader.properties = {"etag": stored["etag"]}
+            return downloader
+
+        def upload_blob(data, overwrite, **kwargs):
+            assert overwrite is True
+            assert kwargs["etag"] == stored["etag"]
+            stored["value"] = data.encode("utf-8") if isinstance(data, str) else data
+            next_etag = int(stored["etag"].strip('"')) + 1
+            stored["etag"] = f'"{next_etag}"'
+
+        blob.download_blob.side_effect = download_blob
+        blob.upload_blob.side_effect = upload_blob
+        container = MagicMock()
+        container.get_blob_client.return_value = blob
+        service = MagicMock()
+        service.get_blob_client.return_value = blob
+        service.get_container_client.return_value = container
+
+        with patch.dict(
+            os.environ,
+            {
+                "AzureWebJobsStorage__accountName": "stcouriertest",
+                "ACS_ENDPOINT": "https://example.communication.azure.com",
+                "SENDER_ADDRESS": "sender@example.com",
+            },
+        ), patch("function_app._blob_service", return_value=service):
+            added = recipients(_recipient_mutation_request("POST", b'{"address":" TWO@EXAMPLE.COM "}'))
+            assert json.loads(added.get_body())["entries"] == ["one@example.com", "two@example.com"]
+            email_client = MagicMock()
+            email_client.begin_send.return_value.result.return_value = {"status": "Succeeded", "id": "operation"}
+            send_request = func.HttpRequest(
+                method="POST",
+                url="http://localhost/api/send",
+                body=b'{"to":"two@example.com","subject":"Test","text":"Body"}',
+            )
+            with patch("function_app.EmailClient", return_value=email_client), patch(
+                "function_app.DefaultAzureCredential"
+            ):
+                assert send(send_request).status_code == 202
+
+            removed = recipients(_recipient_mutation_request("DELETE", b'{"address":"one@example.com"}'))
+            assert json.loads(removed.get_body())["entries"] == ["two@example.com"]
+            blocked_request = func.HttpRequest(
+                method="POST",
+                url="http://localhost/api/send",
+                body=b'{"to":"one@example.com","subject":"Test","text":"Body"}',
+            )
+            assert send(blocked_request).status_code == 403
+
+        assert blob.upload_blob.call_count == 2
+
+    def test_retries_mutation_after_concurrent_blob_change(self):
+        blob = MagicMock()
+        first_download = MagicMock()
+        first_download.readall.return_value = b'["one@example.com"]'
+        first_download.properties = {"etag": '"1"'}
+        second_download = MagicMock()
+        second_download.readall.return_value = b'["one@example.com", "concurrent@example.com"]'
+        second_download.properties = {"etag": '"2"'}
+        blob.download_blob.side_effect = [first_download, second_download]
+        blob.upload_blob.side_effect = [ResourceModifiedError("conflict"), None]
+        container = MagicMock()
+        container.get_blob_client.return_value = blob
+        service = MagicMock()
+        service.get_container_client.return_value = container
+
+        with patch("function_app._blob_service", return_value=service):
+            entries = _update_allowlist_entry("new@example.com", add=True)
+
+        assert entries == ["one@example.com", "concurrent@example.com", "new@example.com"]
+        assert blob.upload_blob.call_count == 2
+        assert blob.upload_blob.call_args.kwargs["etag"] == '"2"'
+
+    def test_rejects_invalid_mutation_address(self):
+        response = recipients(_recipient_mutation_request("POST", b'{"address":"not an address"}'))
+        assert response.status_code == 400
+
+    def test_rejects_invalid_mutation_json(self):
+        response = recipients(_recipient_mutation_request("DELETE", b"not-json"))
+        assert response.status_code == 400
+
+    def test_rejects_oversized_mutation_request(self):
+        response = recipients(_recipient_mutation_request("POST", b"x" * 4097))
+        assert response.status_code == 413
