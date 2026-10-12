@@ -1,6 +1,17 @@
 # DEPLOY — courier
 
-One-time provisioning of the shared email service. **Not yet run** — these are the steps to stand up ACS Email v1.
+The shared email service is **provisioned and live**. These instructions document how to update or recreate the deployment.
+
+## Live deployment (verified 2026-10-12)
+
+- Resource group: `courier-rg`
+- Function App: `func-courier-c0ur1er` (`Running`)
+- Flex Consumption plan: `plan-courier-c0ur1er`
+- Azure Communication Services: `acs-courier-c0ur1er`
+- Email Communication Services: `acs-email-courier-c0ur1er`
+- Sender domains: `mail.naurolabs.com` and `AzureManagedDomain`
+- Storage: `stcourierc0ur1er`
+- Identity and monitoring: `id-courier`, `appi-courier`, and `log-courier`
 
 ## Prerequisites
 - `az` logged in to the Visual Studio Enterprise subscription.
