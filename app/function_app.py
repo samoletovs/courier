@@ -408,28 +408,39 @@ def _feedback_line(project: str, verdict: str, url: str) -> str:
 
 def _append_feedback(project: str, verdict: str, url: str) -> None:
     """Append one vote to feedback/{project}.jsonl, creating the container/blob if new."""
-    service = _blob_service()
-    container = service.get_container_client(FEEDBACK_CONTAINER)
     try:
-        container.create_container()
-    except ResourceExistsError:
-        pass
-    blob = container.get_blob_client(f"{project}.jsonl")
-    if not blob.exists():
+        service = _blob_service()
+        container = service.get_container_client(FEEDBACK_CONTAINER)
         try:
-            blob.create_append_blob()
+            container.create_container()
         except ResourceExistsError:
             pass
-    blob.append_block(_feedback_line(project, verdict, url).encode("utf-8"))
+        blob = container.get_blob_client(f"{project}.jsonl")
+        if not blob.exists():
+            try:
+                blob.create_append_blob()
+            except ResourceExistsError:
+                pass
+        blob.append_block(_feedback_line(project, verdict, url).encode("utf-8"))
+    except Exception:
+        logging.exception("Feedback append failed project=%s", project)
+        raise
+    logging.info("Feedback appended project=%s verdict=%s", project, verdict)
 
 
 def _read_feedback(project: str) -> str:
     """Return the raw JSONL for a project, or '' if it has no votes yet."""
-    blob = _blob_service().get_blob_client(FEEDBACK_CONTAINER, f"{project}.jsonl")
     try:
-        return blob.download_blob().readall().decode("utf-8")
+        blob = _blob_service().get_blob_client(FEEDBACK_CONTAINER, f"{project}.jsonl")
+        data = blob.download_blob().readall().decode("utf-8")
     except ResourceNotFoundError:
+        logging.info("No feedback records found project=%s", project)
         return ""
+    except Exception:
+        logging.exception("Feedback read failed project=%s", project)
+        raise
+    logging.info("Feedback read project=%s bytes=%d", project, len(data.encode("utf-8")))
+    return data
 
 
 @app.route(route="feedback", methods=["GET"], auth_level=func.AuthLevel.ANONYMOUS)
@@ -453,7 +464,6 @@ def feedback(req: func.HttpRequest) -> func.HttpResponse:
     try:
         _append_feedback(project, verdict, url)
     except Exception:  # noqa: BLE001 — best-effort; log details server-side
-        logging.exception("feedback record failed")
         return func.HttpResponse(
             "<!DOCTYPE html><html><body><h1>Could not record — try again later</h1></body></html>",
             status_code=502,
@@ -480,7 +490,6 @@ def feedback_export(req: func.HttpRequest) -> func.HttpResponse:
     try:
         data = _read_feedback(project)
     except Exception:  # noqa: BLE001 — best-effort; log details server-side
-        logging.exception("feedback export failed")
         return func.HttpResponse(
             '{"error":"read failed"}', status_code=502, mimetype="application/json"
         )
