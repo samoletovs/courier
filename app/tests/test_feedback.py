@@ -240,6 +240,47 @@ class TestFeedbackEndpoint:
         resp = feedback(req)
         assert resp.status_code == 400
 
+    @pytest.mark.parametrize(
+        "url",
+        (
+            "https://",
+            "https:///missing-host",
+            "http://",
+            "http:///path",
+            "https://?query",
+            "http://#fragment",
+            "http://:80",
+            "http://user@:80",
+            "http://[::1",
+            "http://[::1]extra",
+            "https://example.com:invalid",
+            "https://example.com:99999",
+            "https://example.com:-1",
+            "https://example.com:65536",
+            "https://example.com:80:90",
+            "http://example.com:abc",
+            "http://example.com/a b",
+            "https://example.com/has space",
+            "http://exa mple.com",
+            "https://exa mple.com/path",
+            "https://example.com/a\tb",
+            "https://example.com/a\nb",
+            "//example.com/path",
+            "gopher://example.com",
+            "javascript:alert(1)",
+            "file:///etc/passwd",
+            "mailto:user@example.com",
+            "https:///example.com/path",
+            "https:// /path",
+        ),
+    )
+    @patch("function_app._append_feedback")
+    def test_malformed_url_returns_400(self, mock_append, url):
+        req = _make_get({**VALID_FEEDBACK_PARAMS, "u": url})
+        resp = feedback(req)
+        assert resp.status_code == 400
+        mock_append.assert_not_called()
+
     def test_oversized_url_returns_400(self):
         req = _make_get({**VALID_FEEDBACK_PARAMS, "u": "https://" + "x" * 2048})
         resp = feedback(req)

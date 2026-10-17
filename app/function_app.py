@@ -16,6 +16,7 @@ import os
 import re
 from datetime import datetime, timezone
 from typing import Protocol
+from urllib.parse import urlsplit
 
 import azure.functions as func
 from azure.communication.email import EmailClient
@@ -438,10 +439,20 @@ def feedback(req: func.HttpRequest) -> func.HttpResponse:
     project = (req.params.get("p") or "").strip().lower()
     verdict = (req.params.get("v") or "").strip().lower()
     url = (req.params.get("u") or "").strip()
+    try:
+        parsed_url = urlsplit(url)
+        valid_url = (
+            parsed_url.scheme in ("http", "https")
+            and bool(parsed_url.hostname)
+            and not any(char.isspace() for char in url)
+        )
+        _ = parsed_url.port
+    except ValueError:
+        valid_url = False
     if (
         not _PROJECT_RE.match(project)
         or verdict not in _FEEDBACK_VERDICTS
-        or not url.startswith(("http://", "https://"))
+        or not valid_url
         or len(url) > MAX_FEEDBACK_URL
     ):
         return func.HttpResponse(
