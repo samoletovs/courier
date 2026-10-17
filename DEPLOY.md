@@ -32,6 +32,8 @@ az deployment group create -g courier-rg `
 
 The deployment outputs `acsEndpoint`, `senderAddress`, `functionAppName`, and `managedIdentityClientId`. The Azure-managed sender domain (`donotreply@<guid>.azurecomm.net`) is created automatically — no DNS needed.
 
+The recipient allowlist parameter is marked secure and provisioned as the `allowed-recipients` Key Vault secret. The Function App receives only a Key Vault reference, resolved with its user-assigned managed identity and the **Key Vault Secrets User** role. Keep the allowlist value private when setting `COURIER_ALLOWED_RECIPIENTS`; local development continues to use `ALLOWED_RECIPIENTS` in `local.settings.json`.
+
 ## 2. Deploy the function code
 
 ```powershell

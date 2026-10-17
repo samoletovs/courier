@@ -59,7 +59,7 @@ Operator-only recipient allowlist management protected by the `recipients` funct
 { "address": "someone@example.org" }
 ```
 
-Changes are stored in the Function's Blob Storage account and immediately used by subsequent sends. Until the first update, the configured `ALLOWED_RECIPIENTS` value is used as the initial allowlist; after an update, the persisted list is authoritative. These operations require the Function managed identity to have Blob Storage data access, as provisioned by `infrastructure/main.bicep`.
+Changes are stored in the Function's Blob Storage account and immediately used by subsequent sends. Until the first update, the `ALLOWED_RECIPIENTS` value is read from Azure Key Vault (locally, from `local.settings.json`); after an update, the persisted list is authoritative. In production the Function resolves a Key Vault reference using its managed identity, which has read-only access to the secret. Allowlist mutations require Blob Storage data access, as provisioned by `infrastructure/main.bicep`.
 
 ### `GET /api/feedback` — record a 👍/👎 vote (anonymous)
 Embed these links in your HTML email. When a recipient clicks one, their vote is appended to a per-project append-blob in Azure Blob Storage and they see a simple confirmation page.
@@ -122,6 +122,7 @@ Function App → returns raw JSONL from the append-blob
 
 `infrastructure/main.bicep` (resource-group scope, `courier-rg`) provisions:
 - User-assigned managed identity
+- Key Vault for the recipient allowlist, with managed-identity secret access
 - Log Analytics + Application Insights (30-day retention, 1 GB/day cap)
 - Storage account (Function host)
 - **Communication Services** + **Email Communication Services** + **Azure-managed domain** + `donotreply` sender
@@ -141,7 +142,7 @@ cd app
 cp local.settings.json.example local.settings.json   # fill ACS_ENDPOINT, SENDER_ADDRESS, ALLOWED_RECIPIENTS
 func start
 ```
-`az login` provides the credential locally (your account needs Contributor on the ACS resource).
+`az login` provides the credential locally (your account needs Contributor on the ACS resource). The local settings file uses environment settings directly; production resolves `ALLOWED_RECIPIENTS` from Key Vault.
 
 The feedback endpoints use `AzureWebJobsStorage__accountName` to locate the storage account. `local.settings.json.example` ships with `"AzureWebJobsStorage": "UseDevelopmentStorage=true"` which routes to the [Azurite](https://learn.microsoft.com/en-us/azure/storage/common/storage-use-azurite) local emulator — start it alongside `func start` for end-to-end local feedback testing.
 

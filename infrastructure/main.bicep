@@ -49,6 +49,7 @@ param suffix string
 param acsDataLocation string = 'Europe'
 
 @description('Comma-separated recipient allowlist (open-relay guard). Emails or domains.')
+@secure()
 param allowedRecipients string
 
 @description('Tags applied to all resources.')
@@ -62,6 +63,7 @@ param tags object = {
 // --- Names ------------------------------------------------------------------
 
 var storageName = toLower('st${namePrefix}${suffix}')
+var keyVaultName = toLower('kv-${namePrefix}-${suffix}')
 var logWorkspaceName = 'log-${namePrefix}'
 var appInsightsName = 'appi-${namePrefix}'
 var managedIdentityName = 'id-${namePrefix}'
@@ -72,6 +74,7 @@ var emailServiceName = 'acs-email-${namePrefix}-${suffix}'
 
 // Contributor — the documented ACS Entra data-plane role (no narrower email role today).
 var contributorRoleId = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'b24988ac-6180-42a0-ab88-20f7382dd24c')
+var keyVaultSecretsUserRoleId = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '4633458b-17de-408a-b874-0445c86b69e6')
 
 // --- Managed identity -------------------------------------------------------
 
@@ -79,6 +82,40 @@ resource uami 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
   name: managedIdentityName
   location: location
   tags: tags
+}
+
+// Keep the recipient allowlist out of Function App settings and deployment history.
+resource keyVault 'Microsoft.KeyVault/vaults@2023-07-01' = {
+  name: keyVaultName
+  location: location
+  tags: tags
+  properties: {
+    tenantId: subscription().tenantId
+    sku: {
+      family: 'A'
+      name: 'standard'
+    }
+    enableRbacAuthorization: true
+    enablePurgeProtection: true
+  }
+}
+
+resource allowedRecipientsSecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = {
+  parent: keyVault
+  name: 'allowed-recipients'
+  properties: {
+    value: allowedRecipients
+  }
+}
+
+resource keyVaultSecretsUser 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  scope: keyVault
+  name: guid(keyVault.id, uami.id, keyVaultSecretsUserRoleId)
+  properties: {
+    roleDefinitionId: keyVaultSecretsUserRoleId
+    principalId: uami.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
 }
 
 // --- Log Analytics + App Insights -------------------------------------------
@@ -303,6 +340,7 @@ resource functionApp 'Microsoft.Web/sites@2024-04-01' = {
     serverFarmId: functionPlan.id
     httpsOnly: true
     publicNetworkAccess: 'Enabled'
+    keyVaultReferenceIdentity: uami.id
     functionAppConfig: {
       deployment: {
         storage: {
@@ -357,11 +395,14 @@ resource functionApp 'Microsoft.Web/sites@2024-04-01' = {
         }
         {
           name: 'ALLOWED_RECIPIENTS'
-          value: allowedRecipients
+          value: '@Microsoft.KeyVault(VaultName=${keyVault.name};SecretName=${allowedRecipientsSecret.name})'
         }
       ]
     }
   }
+  dependsOn: [
+    keyVaultSecretsUser
+  ]
 }
 
 // Storage RBAC for the Function host identity (shared-key access is disabled).
