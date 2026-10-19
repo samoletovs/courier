@@ -1,6 +1,7 @@
 """Tests for feedback endpoints and helper functions."""
 
 import json
+import logging
 import sys
 import os
 from unittest.mock import MagicMock, patch, call
@@ -101,11 +102,13 @@ class TestAppendFeedback:
 
     @patch("function_app._blob_service")
     @patch.dict(os.environ, STORAGE_ENV)
-    def test_appends_to_existing_blob(self, mock_blob_service):
+    def test_appends_to_existing_blob(self, mock_blob_service, caplog):
+        caplog.set_level(logging.INFO)
         service_mock, container_mock, blob_mock = self._make_mocks()
         mock_blob_service.return_value = service_mock
 
-        _append_feedback("myproject", "up", "https://example.com")
+        url = "https://example.com"
+        _append_feedback("myproject", "up", url)
 
         container_mock.create_container.assert_called_once()
         blob_mock.append_block.assert_called_once()
@@ -113,6 +116,8 @@ class TestAppendFeedback:
         record = json.loads(block_data.decode("utf-8"))
         assert record["project"] == "myproject"
         assert record["verdict"] == "up"
+        assert "Feedback appended project=myproject verdict=up" in caplog.text
+        assert url not in caplog.text
 
     @patch("function_app._blob_service")
     @patch.dict(os.environ, STORAGE_ENV)
@@ -152,6 +157,16 @@ class TestAppendFeedback:
         _append_feedback("proj", "up", "https://example.com")
         blob_mock.append_block.assert_called_once()
 
+    @patch("function_app._blob_service", side_effect=RuntimeError("storage unavailable"))
+    @patch.dict(os.environ, STORAGE_ENV)
+    def test_storage_error_is_logged(self, _mock_blob_service, caplog):
+        caplog.set_level(logging.ERROR)
+
+        with pytest.raises(RuntimeError, match="storage unavailable"):
+            _append_feedback("proj", "up", "https://example.com")
+
+        assert "Feedback append failed project=proj" in caplog.text
+
 
 # ---------------------------------------------------------------------------
 # _read_feedback
@@ -160,7 +175,8 @@ class TestAppendFeedback:
 class TestReadFeedback:
     @patch("function_app._blob_service")
     @patch.dict(os.environ, STORAGE_ENV)
-    def test_returns_blob_content(self, mock_blob_service):
+    def test_returns_blob_content(self, mock_blob_service, caplog):
+        caplog.set_level(logging.INFO)
         jsonl = '{"project":"p1","verdict":"up","url":"https://x.com","ts":"2026-01-01T00:00:00+00:00"}\n'
         blob_mock = MagicMock()
         blob_mock.download_blob.return_value.readall.return_value = jsonl.encode()
@@ -170,10 +186,13 @@ class TestReadFeedback:
 
         result = _read_feedback("p1")
         assert result == jsonl
+        assert "Feedback read project=p1" in caplog.text
+        assert "https://x.com" not in caplog.text
 
     @patch("function_app._blob_service")
     @patch.dict(os.environ, STORAGE_ENV)
-    def test_returns_empty_string_when_not_found(self, mock_blob_service):
+    def test_returns_empty_string_when_not_found(self, mock_blob_service, caplog):
+        caplog.set_level(logging.INFO)
         from azure.core.exceptions import ResourceNotFoundError
 
         blob_mock = MagicMock()
@@ -184,6 +203,17 @@ class TestReadFeedback:
 
         result = _read_feedback("no-votes-yet")
         assert result == ""
+        assert "No feedback records found project=no-votes-yet" in caplog.text
+
+    @patch("function_app._blob_service", side_effect=RuntimeError("storage unavailable"))
+    @patch.dict(os.environ, STORAGE_ENV)
+    def test_storage_error_is_logged(self, _mock_blob_service, caplog):
+        caplog.set_level(logging.ERROR)
+
+        with pytest.raises(RuntimeError, match="storage unavailable"):
+            _read_feedback("proj")
+
+        assert "Feedback read failed project=proj" in caplog.text
 
 
 # ---------------------------------------------------------------------------
