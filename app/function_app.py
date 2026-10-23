@@ -139,35 +139,42 @@ def _read_allowlist_entries() -> list[str]:
 
 
 def _update_allowlist_entry(address: str, add: bool) -> list[str]:
-    service = _blob_service()
-    container = service.get_container_client(ALLOWLIST_CONTAINER)
     try:
-        container.create_container()
-    except ResourceExistsError:
-        pass
-    blob = container.get_blob_client(ALLOWLIST_BLOB)
-
-    for _ in range(MAX_ALLOWLIST_UPDATE_ATTEMPTS):
-        entries, etag = _read_allowlist_blob(blob)
-        if add:
-            if address not in entries:
-                entries.append(address)
-        else:
-            entries = [entry for entry in entries if entry != address]
-
+        service = _blob_service()
+        container = service.get_container_client(ALLOWLIST_CONTAINER)
         try:
-            if etag is None:
-                blob.upload_blob(json.dumps(entries), overwrite=False)
+            container.create_container()
+        except ResourceExistsError:
+            pass
+        blob = container.get_blob_client(ALLOWLIST_BLOB)
+
+        for attempt in range(MAX_ALLOWLIST_UPDATE_ATTEMPTS):
+            entries, etag = _read_allowlist_blob(blob)
+            if add:
+                if address not in entries:
+                    entries.append(address)
             else:
-                blob.upload_blob(
-                    json.dumps(entries),
-                    overwrite=True,
-                    etag=etag,
-                    match_condition=MatchConditions.IfNotModified,
+                entries = [entry for entry in entries if entry != address]
+
+            try:
+                if etag is None:
+                    blob.upload_blob(json.dumps(entries), overwrite=False)
+                else:
+                    blob.upload_blob(
+                        json.dumps(entries),
+                        overwrite=True,
+                        etag=etag,
+                        match_condition=MatchConditions.IfNotModified,
+                    )
+                return entries
+            except (ResourceExistsError, ResourceModifiedError) as exc:
+                logging.warning(
+                    "Recipient allowlist update conflict attempt=%d error=%s", attempt + 1, type(exc).__name__
                 )
-            return entries
-        except (ResourceExistsError, ResourceModifiedError):
-            continue
+    except (ResourceNotFoundError, ResourceModifiedError) as exc:
+        logging.error("Recipient allowlist update failed error=%s", type(exc).__name__)
+        raise
+    logging.error("Recipient allowlist update failed after %d attempts", MAX_ALLOWLIST_UPDATE_ATTEMPTS)
     raise RuntimeError("Recipient allowlist changed during update")
 
 
@@ -333,8 +340,8 @@ def recipients(req: func.HttpRequest) -> func.HttpResponse:
             return func.HttpResponse('{"error":"invalid address"}', status_code=400, mimetype="application/json")
         try:
             entries = _update_allowlist_entry(address, add=req.method == "POST")
-        except Exception:  # noqa: BLE001 — do not expose storage details to callers
-            logging.exception("Recipient allowlist update failed")
+        except Exception as exc:  # noqa: BLE001 — do not expose storage details to callers
+            logging.error("Recipient allowlist update failed error=%s", type(exc).__name__)
             return func.HttpResponse(
                 '{"error":"recipient allowlist update failed"}', status_code=502, mimetype="application/json"
             )
