@@ -1,17 +1,20 @@
 """Tests for recipient allowlist management."""
 
 import json
+import logging
 import os
 import sys
 from unittest.mock import MagicMock, patch
 
 import azure.functions as func
-from azure.core.exceptions import ResourceModifiedError
+import pytest
+from azure.core.exceptions import ResourceModifiedError, ResourceNotFoundError
 
 # Ensure the app package is on the path.
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from function_app import (  # noqa: E402
     MAX_ADDRESS_LENGTH,
+    MAX_ALLOWLIST_UPDATE_ATTEMPTS,
     EnvRecipientManager,
     _allowlist,
     _is_allowed,
@@ -208,7 +211,7 @@ class TestRecipientsEndpoint:
 
         assert blob.upload_blob.call_count == 2
 
-    def test_retries_mutation_after_concurrent_blob_change(self):
+    def test_retries_mutation_after_concurrent_blob_change(self, caplog):
         blob = MagicMock()
         first_download = MagicMock()
         first_download.readall.return_value = b'["one@example.com"]'
@@ -229,6 +232,69 @@ class TestRecipientsEndpoint:
         assert entries == ["one@example.com", "concurrent@example.com", "new@example.com"]
         assert blob.upload_blob.call_count == 2
         assert blob.upload_blob.call_args.kwargs["etag"] == '"2"'
+        assert "Recipient allowlist update conflict" in caplog.text
+        assert not any(record.levelno >= logging.ERROR for record in caplog.records)
+
+    @pytest.mark.parametrize("error_type", [ResourceNotFoundError, ResourceModifiedError])
+    @pytest.mark.parametrize("operation", ["create", "read", "upload"])
+    def test_logs_storage_update_errors(self, error_type, operation, caplog):
+        service = MagicMock()
+        container = service.get_container_client.return_value
+        blob = container.get_blob_client.return_value
+        error = error_type("Storage details for private@example.com")
+        read_result = (["one@example.com"], '"1"')
+        if operation == "create":
+            container.create_container.side_effect = error
+        elif operation == "upload":
+            blob.upload_blob.side_effect = error
+
+        with patch("function_app._blob_service", return_value=service), patch(
+            "function_app._read_allowlist_blob",
+            return_value=read_result,
+            side_effect=error if operation == "read" else None,
+        ):
+            expected_error = RuntimeError if operation == "upload" and error_type is ResourceModifiedError else error_type
+            with pytest.raises(expected_error):
+                _update_allowlist_entry("new@example.com", add=True)
+
+        assert any(
+            record.levelno == logging.ERROR and "Recipient allowlist update" in record.message
+            for record in caplog.records
+        )
+        assert "private@example.com" not in caplog.text
+        assert "new@example.com" not in caplog.text
+        if operation == "upload" and error_type is ResourceModifiedError:
+            assert blob.upload_blob.call_count == MAX_ALLOWLIST_UPDATE_ATTEMPTS
+        elif operation == "upload":
+            blob.upload_blob.assert_called_once()
+
+    @pytest.mark.parametrize("method", ["POST", "DELETE"])
+    @pytest.mark.parametrize("error_type", [ResourceNotFoundError, ResourceModifiedError])
+    def test_returns_safe_error_when_allowlist_update_fails(self, method, error_type, caplog):
+        service = MagicMock()
+        service.get_container_client.return_value.create_container.side_effect = error_type(
+            "Storage details for private@example.com"
+        )
+        with patch("function_app._blob_service", return_value=service):
+            response = recipients(_recipient_mutation_request(method, b'{"address":"new@example.com"}'))
+
+        assert response.status_code == 502
+        assert json.loads(response.get_body()) == {"error": "recipient allowlist update failed"}
+        assert "private@example.com" not in caplog.text
+        assert "new@example.com" not in caplog.text
+
+    def test_missing_blob_initializes_from_environment_without_error(self, caplog):
+        service = MagicMock()
+        blob = service.get_container_client.return_value.get_blob_client.return_value
+        blob.download_blob.side_effect = ResourceNotFoundError("No blob yet")
+        with patch("function_app._blob_service", return_value=service), patch.dict(
+            os.environ, {"ALLOWED_RECIPIENTS": "one@example.com"}
+        ):
+            entries = _update_allowlist_entry("new@example.com", add=True)
+
+        assert entries == ["one@example.com", "new@example.com"]
+        blob.upload_blob.assert_called_once_with(json.dumps(entries), overwrite=False)
+        assert not any(record.levelno >= logging.ERROR for record in caplog.records)
 
     def test_rejects_invalid_mutation_address(self):
         response = recipients(_recipient_mutation_request("POST", b'{"address":"not an address"}'))
