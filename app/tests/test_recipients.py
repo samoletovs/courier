@@ -182,7 +182,9 @@ class TestRecipientsEndpoint:
                 "ACS_ENDPOINT": "https://example.communication.azure.com",
                 "SENDER_ADDRESS": "sender@example.com",
             },
-        ), patch("function_app._blob_service", return_value=service):
+        ), patch("function_app._blob_service", return_value=service), patch(
+            "function_app._shared_send_rate_limit_retry_after", return_value=None
+        ):
             added = recipients(_recipient_mutation_request("POST", b'{"address":" TWO@EXAMPLE.COM "}'))
             assert json.loads(added.get_body())["entries"] == ["one@example.com", "two@example.com"]
             email_client = MagicMock()
