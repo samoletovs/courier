@@ -10,10 +10,15 @@ votes are appended to a per-project append-blob in the Function's storage accoun
 (same managed identity, Storage Blob Data Owner) — no separate database.
 """
 
+import hashlib
 import json
 import logging
+import math
 import os
 import re
+import threading
+import time
+from collections import deque
 from datetime import datetime, timezone
 from typing import Protocol
 from urllib.parse import urlsplit
@@ -29,6 +34,10 @@ app = func.FunctionApp()
 
 MAX_BODY_BYTES = 256 * 1024  # cap payload size (HTML newsletters are small)
 MAX_ADDRESS_LENGTH = 320  # RFC 5321 max email address length
+SEND_RATE_LIMIT = 10
+SEND_RATE_WINDOW_SECONDS = 60
+_send_rate_limit_lock = threading.Lock()
+_send_rate_limit_requests: dict[str, deque[float]] = {}
 
 # --- Feedback ledger (append-blob per project) ------------------------------
 FEEDBACK_CONTAINER = "feedback"
@@ -198,8 +207,35 @@ def _as_list(value) -> list[str]:
     return []
 
 
+def _send_rate_limit_retry_after(req: func.HttpRequest) -> int | None:
+    function_key = req.headers.get("x-functions-key") or req.params.get("code")
+    bucket = hashlib.sha256(function_key.encode("utf-8")).hexdigest() if function_key else "anonymous"
+    now = time.monotonic()
+    with _send_rate_limit_lock:
+        cutoff = now - SEND_RATE_WINDOW_SECONDS
+        for stale_bucket, timestamps in list(_send_rate_limit_requests.items()):
+            while timestamps and timestamps[0] <= cutoff:
+                timestamps.popleft()
+            if not timestamps:
+                del _send_rate_limit_requests[stale_bucket]
+        requests = _send_rate_limit_requests.setdefault(bucket, deque())
+        if len(requests) >= SEND_RATE_LIMIT:
+            return max(1, math.ceil(requests[0] + SEND_RATE_WINDOW_SECONDS - now))
+        requests.append(now)
+    return None
+
+
 @app.route(route="send", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
 def send(req: func.HttpRequest) -> func.HttpResponse:
+    retry_after = _send_rate_limit_retry_after(req)
+    if retry_after is not None:
+        return func.HttpResponse(
+            '{"error":"rate limit exceeded"}',
+            status_code=429,
+            mimetype="application/json",
+            headers={"Retry-After": str(retry_after)},
+        )
+
     body_bytes = req.get_body() or b""
     if len(body_bytes) > MAX_BODY_BYTES:
         return func.HttpResponse('{"error":"payload too large"}', status_code=413, mimetype="application/json")
