@@ -33,6 +33,8 @@ Response: `{ "status": "Succeeded", "id": "<operation-id>" }`.
 **Guardrails**
 - Recipients must match `ALLOWED_RECIPIENTS` (comma-separated emails/domains). Anything else is rejected — courier is **not** an open relay.
 - A `send` function-specific key is required. Store it as a secret in each caller (e.g. a GitHub Actions secret). Do not distribute the host key or the `recipients` function key to send-only callers.
+- Supply the key either as `?code=` or in the `x-functions-key` header, not both.
+- Each function key is limited to 10 send requests per rolling minute. Excess requests receive `429` with a `Retry-After` header; production limits are shared through Blob Storage.
 
 ### `/api/recipients?code=<function-key>` — inspect or manage the allowlist
 
